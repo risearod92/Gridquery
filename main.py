@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from typing import List
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 # Import your two new infrastructure files!
 import database
@@ -42,7 +43,15 @@ class SubstationResponse(SubstationAsset):
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "service": "GridQuery API Engine"}
+    return {"status": "ok", "service": "GridQuery API Engine"}
+
+@app.get("/health")
+def health_check(db: Session = Depends(database.get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
 # Notice the injection: db: Session = Depends(database.get_db)
 @app.get("/substations", response_model=List[SubstationResponse])
