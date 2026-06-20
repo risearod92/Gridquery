@@ -1,10 +1,18 @@
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel
+from fastapi import FastAPI, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict
 from typing import List
+from sqlalchemy.orm import Session
+
+# Import your two new infrastructure files!
+import database
+import models
 
 # ==========================================
-# 1. INITIALIZATION & CONFIGURATION
+# 1. INITIALIZATION & DATABASE SYNC
 # ==========================================
+# This tells SQLAlchemy to look at models.py and build the shelves in Postgres
+database.Base.metadata.create_all(bind=database.engine)
+
 app = FastAPI(
     title="GridQuery Backend",
     description="Core API engine for geospatial energy asset routing",
@@ -14,20 +22,19 @@ app = FastAPI(
 # ==========================================
 # 2. DATA BLUEPRINTS (PYDANTIC MODELS)
 # ==========================================
-# These must go near the top so your route functions below can see them!
 class SubstationAsset(BaseModel):
     name: str
     capacity_mw: int
     state: str
     is_active: bool = True
 
-# ==========================================
-# 3. STORAGE LAYER (MOCK DATABASE)
-# ==========================================
-db_mock_storage = [
-    {"id": 1, "name": "Athens Substation", "capacity_mw": 500, "state": "NY", "is_active": True},
-    {"id": 2, "name": "Bowline Substation", "capacity_mw": 1200, "state": "NY", "is_active": True}
-]
+# To send data OUT of the API, we need to tell Pydantic to expect a database ID,
+# and we need to tell it to play nicely with SQLAlchemy ORM objects.
+class SubstationResponse(SubstationAsset):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
+
+# Notice: The db_mock_storage list is COMPLETELY GONE.
 
 # ==========================================
 # 4. GET ROUTES (READ OPERATIONS)
@@ -37,46 +44,62 @@ db_mock_storage = [
 def read_root():
     return {"status": "healthy", "service": "GridQuery API Engine"}
 
-# Your old path/query tests from Day 1
-@app.get("/substations", response_model=List[dict])
-def get_all_substations():
-    return db_mock_storage
+# Notice the injection: db: Session = Depends(database.get_db)
+@app.get("/substations", response_model=List[SubstationResponse])
+def get_all_substations(db: Session = Depends(database.get_db)):
+    assets = db.query(models.DBSubstationAsset).all()
+    return assets
 
-@app.get("/substations/{asset_id}")
-def get_single_substation(asset_id: int):
-    for asset in db_mock_storage:
-        if asset["id"] == asset_id:
-            return asset
-    raise HTTPException(status_code=404, detail="Asset not found.")
+@app.get("/substations/{asset_id}", response_model=SubstationResponse)
+def get_single_substation(asset_id: int, db: Session = Depends(database.get_db)):
+    asset = db.query(models.DBSubstationAsset).filter(models.DBSubstationAsset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found in Postgres.")
+    return asset
 
 # ==========================================
 # 5. DATA MUTATION ROUTES (CREATE, UPDATE, DELETE)
 # ==========================================
-# Group your new operational tools neatly together at the bottom
 
-@app.post("/substations", status_code=status.HTTP_201_CREATED)
-def create_substation(payload: SubstationAsset):
-    new_id = len(db_mock_storage) + 1
-    new_asset_dict = payload.model_dump()
-    new_asset_dict["id"] = new_id
-    db_mock_storage.append(new_asset_dict)
-    return {"message": "Asset created successfully", "data": new_asset_dict}
+@app.post("/substations", response_model=SubstationResponse, status_code=status.HTTP_201_CREATED)
+def create_substation(payload: SubstationAsset, db: Session = Depends(database.get_db)):
+    # 1. Convert Pydantic payload to dict
+    # 2. Unpack into the SQLAlchemy model
+    new_asset = models.DBSubstationAsset(**payload.model_dump())
+    
+    # 3. Write to Postgres
+    db.add(new_asset)
+    db.commit()
+    db.refresh(new_asset) # Grabs the auto-generated ID from Postgres
+    
+    return new_asset
 
-@app.put("/substations/{asset_id}")
-def update_substation(asset_id: int, payload: SubstationAsset):
-    for asset in db_mock_storage:
-        if asset["id"] == asset_id:
-            asset["name"] = payload.name
-            asset["capacity_mw"] = payload.capacity_mw
-            asset["state"] = payload.state
-            asset["is_active"] = payload.is_active
-            return {"message": f"Asset {asset_id} updated", "data": asset}
-    raise HTTPException(status_code=404, detail="Asset not found.")
+@app.put("/substations/{asset_id}", response_model=SubstationResponse)
+def update_substation(asset_id: int, payload: SubstationAsset, db: Session = Depends(database.get_db)):
+    # Find the existing row
+    db_asset = db.query(models.DBSubstationAsset).filter(models.DBSubstationAsset.id == asset_id).first()
+    if not db_asset:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    
+    # Update the row's attributes
+    db_asset.name = payload.name
+    db_asset.capacity_mw = payload.capacity_mw
+    db_asset.state = payload.state
+    db_asset.is_active = payload.is_active
+    
+    # Save the changes
+    db.commit()
+    db.refresh(db_asset)
+    return db_asset
 
 @app.delete("/substations/{asset_id}")
-def delete_substation(asset_id: int):
-    for index, asset in enumerate(db_mock_storage):
-        if asset["id"] == asset_id:
-            deleted_asset = db_mock_storage.pop(index)
-            return {"message": "Asset deleted", "purged_data": deleted_asset}
-    raise HTTPException(status_code=404, detail="Asset not found.")
+def delete_substation(asset_id: int, db: Session = Depends(database.get_db)):
+    # Find the existing row
+    db_asset = db.query(models.DBSubstationAsset).filter(models.DBSubstationAsset.id == asset_id).first()
+    if not db_asset:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    
+    # Destroy it
+    db.delete(db_asset)
+    db.commit()
+    return {"message": f"Asset {asset_id} permanently deleted from Postgres."}
